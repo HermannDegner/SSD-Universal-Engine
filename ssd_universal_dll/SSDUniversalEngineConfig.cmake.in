@@ -1,0 +1,24 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+
+# SSD Universal Engine ライブラリのターゲットをインポート
+if(NOT TARGET SSDUniversalEngine::ssd_universal_engine)
+    include("${CMAKE_CURRENT_LIST_DIR}/SSDUniversalEngineTargets.cmake")
+endif()
+
+# 利用可能なコンポーネントの確認
+set(SSDUniversalEngine_COMPONENTS ssd_universal_engine)
+
+# 変数の設定
+set(SSDUniversalEngine_LIBRARIES SSDUniversalEngine::ssd_universal_engine)
+set(SSDUniversalEngine_INCLUDE_DIRS "@PACKAGE_CMAKE_INSTALL_INCLUDEDIR@")
+
+# バージョン情報
+set(SSDUniversalEngine_VERSION "@PROJECT_VERSION@")
+set(SSDUniversalEngine_VERSION_MAJOR "@PROJECT_VERSION_MAJOR@")
+set(SSDUniversalEngine_VERSION_MINOR "@PROJECT_VERSION_MINOR@")
+set(SSDUniversalEngine_VERSION_PATCH "@PROJECT_VERSION_PATCH@")
+
+# 設定チェック
+check_required_components(SSDUniversalEngine)
