@@ -1,0 +1,11 @@
+prefix=@CMAKE_INSTALL_PREFIX@
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib
+includedir=${prefix}/include
+
+Name: SSD Universal Engine
+Description: Structural Subjectivity Dynamics Universal Evaluation Engine
+Version: 1.0.0
+URL: https://example.com/ssd
+Libs: -L${libdir} -lssd_universal_engine
+Cflags: -I${includedir}
