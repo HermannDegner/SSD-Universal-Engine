@@ -1,0 +1,151 @@
+--- a/ssd_universal_engine_dll.cpp
++++ b/ssd_universal_engine_dll.cpp
+@@ -5,7 +5,6 @@
+ 
+ #define SSD_UNIVERSAL_DLL_EXPORTS
+ #include "ssd_universal_engine_dll.h"
+-#include "ssd_align_leap_dll.h"
+ 
+ #include <vector>
+ #include <string>
+@@ -17,6 +16,7 @@
+ #include <chrono>
+ #include <unordered_map>
+ #include <stdexcept>
++#include <mutex>
+ 
+ /* ========================================
+  * 内部データ構造
+@@ -43,6 +43,10 @@
+     std::string engine_id;
+     std::string version;
+     std::chrono::steady_clock::time_point start_time;
++    
++    // 共有資源用ミューテックス
++    std::mutex cache_mutex;
++    std::mutex stats_mutex;
+     
+     // 統計情報
+     uint64_t total_evaluations;
+@@ -228,10 +232,12 @@
+         size_t hash_key = 0;
+         if (config.enable_cache) {
+             hash_key = calculate_hash(structures, structure_count, pressures, pressure_count, context);
++            std::lock_guard<std::mutex> lock(cache_mutex);
+             auto cache_it = cache.find(hash_key);
+             if (cache_it != cache.end()) {
+                 *result = cache_it->second.result;
+                 strncpy(result->evaluation_id, engine_id.c_str(), sizeof(result->evaluation_id) - 1);
++                result->evaluation_id[sizeof(result->evaluation_id) - 1] = '\0';
+                 cache_hits++;
+                 return SSD_SUCCESS;
+             }
+@@ -240,6 +246,7 @@
+         // 結果構造体初期化
+         memset(result, 0, sizeof(SSDUniversalEvaluationResult));
+         strncpy(result->evaluation_id, engine_id.c_str(), sizeof(result->evaluation_id) - 1);
++                result->evaluation_id[sizeof(result->evaluation_id) - 1] = '\0';
+         
+         // ドメイン係数取得
+         auto coeff_it = domain_coefficients.find(context->domain);
+@@ -285,7 +292,8 @@
+         
+         // 8. 予測期間推定
+         double scale_factors[] = {1e-15, 1e-12, 1e-9, 1e-3, 1e3, 1e6, 1e9, 1e12};
+-        result->prediction_horizon = scale_factors[context->scale_level] * context->time_scale;
++        int sl = std::max(0, std::min(context->scale_level, 7));
++        result->prediction_horizon = scale_factors[sl] * context->time_scale * coeff.time_scale_factor;
+         
+         // 9. 警告・推奨生成
+         generate_warnings_and_recommendations(*result, result->warning_flags, 
+@@ -309,7 +317,10 @@
+             entry.result = *result;
+             entry.timestamp = std::chrono::steady_clock::now();
+             entry.hash_key = hash_key;
++            {
++            std::lock_guard<std::mutex> lock(cache_mutex);
+             cache[hash_key] = entry;
++        }
+         }
+         
+         // 12. 統計更新
+@@ -552,7 +563,12 @@
+     
+     if (structure_count == 0 || pressure_count == 0) return;
+     
+-    std::vector<double> jump_probabilities;
++    
++    // 平均κ（構造安定性）を簡易推定
++    double kappa_bar = 0.0;
++    for (int32_t i = 0; i < structure_count; i++) { kappa_bar += structures[i].stability_index; }
++    if (structure_count > 0) kappa_bar /= structure_count;
++std::vector<double> jump_probabilities;
+     std::vector<std::vector<double>> jump_directions;
+     std::vector<double> jump_impacts;
+     std::vector<double> weights;
+@@ -565,12 +581,16 @@
+             const auto& p = pressures[j];
+             double pressure_intensity = p.magnitude;
+             
+-            // 跳躍確率
++            // 跳躍確率（SSD形：σ((E−Θ)/γ)）
+             double prob = 0.0;
+-            if (pressure_intensity > structure_limit) {
+-                double excess = pressure_intensity - structure_limit;
+-                prob = std::min(1.0, excess * 2.0);
+-            }
++            double P = std::max(0.0, std::min(1.0, pressure_intensity));
++            double J = std::max(0.0, std::min(1.0, kappa_bar * P));
++            double E = std::max(0.0, P - J);
++            double theta = 0.3 + 0.6 * kappa_bar; // κが高いほど閾値が上がる
++            double beta = 0.0; // 将来: context->theoria_beta を導入
++            double x = (E - theta) * (1.0 - beta);
++            prob = 1.0 / (1.0 + std::exp(-4.0 * x));
++            prob = std::max(0.0, std::min(1.0, prob));
+             jump_probabilities.push_back(prob);
+             weights.push_back(prob);
+             
+@@ -737,13 +757,18 @@
+     for (int32_t i = 0; i < pressure_count; i++) {
+         hash ^= std::hash<std::string>{}(pressures[i].pressure_id) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+     }
+-    
++    // コンテキスト要素をハッシュに反映
++    hash ^= std::hash<int>{}(static_cast<int>(context->domain)) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
++    hash ^= std::hash<int>{}(context->scale_level) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
++    hash ^= std::hash<long long>{}(llround(context->time_scale * 1e6)) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
++    hash ^= std::hash<long long>{}(llround(context->measurement_precision * 1000)) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+     hash ^= std::hash<std::string>{}(context->context_id) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+     
+     return hash;
+ }
+ 
+ void SSDUniversalEngine::update_statistics(double computation_time, double confidence) {
++    std::lock_guard<std::mutex> lock(stats_mutex);
+     total_evaluations++;
+     total_computation_time += computation_time;
+     
+@@ -1018,11 +1043,23 @@
+             comp.binding_count = 0;
+             components.push_back(comp);
+         }
++        // 環境要因の平均で慣性強度を微調整（0.9〜1.1倍）
++        if (env_count > 0) {
++            double env_sum = 0.0; int n = std::min(env_count, 8);
++            for (int i = 0; i < n; ++i) env_sum += environmental_factors[i];
++            double env = env_sum / n; // 想定範囲: 0..1
++            double factor = std::max(0.9, std::min(1.1, 0.9 + 0.2 * env));
++            for (auto& c : components) {
++                c.base_strength = std::max(0.0, std::min(1.0, c.base_strength * factor));
++            }
++        }
++
+         
+         // 評価コンテキスト構築
+         SSDEvaluationContext context;
+         memset(&context, 0, sizeof(context));
+         strncpy(context.context_id, action_id, sizeof(context.context_id) - 1);
++        context.context_id[sizeof(context.context_id) - 1] = '\0';
+         context.domain = SSD_DOMAIN_AI;
+         context.scale_level = SSD_SCALE_ORGANISM;
+         context.time_scale = 1.0;
